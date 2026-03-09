@@ -20,6 +20,14 @@ data/
 # Logs
 *.log
 *.pid
+startup.log
+backend.log
+frontend.log
+
+# Unnecessary files
+header.jpg
+start.sh
+main.py
 
 # Windows
 Thumbs.db
