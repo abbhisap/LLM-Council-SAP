@@ -381,3 +381,6 @@ Free to use, modify, and distribute.
 # LLM-Council-SAP
 Personal AI Council - 5 LLM models debate SAP questions. Built with FastAPI, React, Grok API. FREE to run locally.
 >>>>>>> 3111aee40c39bc92e0fe609a434819af34fc38fc
+
+---
+*Built by Abhishek Singh — SAP Functional Consultant*
