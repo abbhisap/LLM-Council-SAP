@@ -1,6 +1,6 @@
 """FastAPI backend for LLM Council."""
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -8,13 +8,22 @@ from typing import List, Dict, Any
 import uuid
 import json
 import asyncio
+import httpx
+import base64
+import io
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .council import (
+    run_full_council,
+    generate_conversation_title,
+    stage1_collect_responses,
+    stage2_collect_rankings,
+    stage3_synthesize_final,
+    calculate_aggregate_rankings
+)
 
 app = FastAPI(title="LLM Council API")
 
-# Enable CORS for local development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000"],
@@ -25,17 +34,14 @@ app.add_middleware(
 
 
 class CreateConversationRequest(BaseModel):
-    """Request to create a new conversation."""
     pass
 
 
 class SendMessageRequest(BaseModel):
-    """Request to send a message in a conversation."""
     content: str
 
 
 class ConversationMetadata(BaseModel):
-    """Conversation metadata for list view."""
     id: str
     created_at: str
     title: str
@@ -43,7 +49,6 @@ class ConversationMetadata(BaseModel):
 
 
 class Conversation(BaseModel):
-    """Full conversation with all messages."""
     id: str
     created_at: str
     title: str
@@ -52,19 +57,16 @@ class Conversation(BaseModel):
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
     return {"status": "ok", "service": "LLM Council API"}
 
 
 @app.get("/api/conversations", response_model=List[ConversationMetadata])
 async def list_conversations():
-    """List all conversations (metadata only)."""
     return storage.list_conversations()
 
 
 @app.post("/api/conversations", response_model=Conversation)
 async def create_conversation(request: CreateConversationRequest):
-    """Create a new conversation."""
     conversation_id = str(uuid.uuid4())
     conversation = storage.create_conversation(conversation_id)
     return conversation
@@ -72,7 +74,6 @@ async def create_conversation(request: CreateConversationRequest):
 
 @app.get("/api/conversations/{conversation_id}", response_model=Conversation)
 async def get_conversation(conversation_id: str):
-    """Get a specific conversation with all its messages."""
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -80,33 +81,29 @@ async def get_conversation(conversation_id: str):
 
 
 @app.post("/api/conversations/{conversation_id}/message")
-async def send_message(conversation_id: str, request: SendMessageRequest):
-    """
-    Send a message and run the 3-stage council process.
-    Returns the complete response with all stages.
-    """
-    # Check if conversation exists
+async def send_message(
+    conversation_id: str,
+    request: SendMessageRequest
+):
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
+    conversation_history = conversation.get("messages", [])
 
-    # Add user message
     storage.add_user_message(conversation_id, request.content)
 
-    # If this is the first message, generate a title
     if is_first_message:
         title = await generate_conversation_title(request.content)
         storage.update_conversation_title(conversation_id, title)
 
-    # Run the 3-stage council process
-    stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
-    )
+    stage1_results, stage2_results, stage3_result, metadata = \
+        await run_full_council(
+            request.content,
+            conversation_history
+        )
 
-    # Add assistant message with all stages
     storage.add_assistant_message(
         conversation_id,
         stage1_results,
@@ -114,7 +111,6 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         stage3_result
     )
 
-    # Return the complete response with metadata
     return {
         "stage1": stage1_results,
         "stage2": stage2_results,
@@ -124,52 +120,58 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
 
 
 @app.post("/api/conversations/{conversation_id}/message/stream")
-async def send_message_stream(conversation_id: str, request: SendMessageRequest):
-    """
-    Send a message and stream the 3-stage council process.
-    Returns Server-Sent Events as each stage completes.
-    """
-    # Check if conversation exists
+async def send_message_stream(
+    conversation_id: str,
+    request: SendMessageRequest
+):
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
+    conversation_history = conversation.get("messages", [])
 
     async def event_generator():
         try:
-            # Add user message
             storage.add_user_message(conversation_id, request.content)
 
-            # Start title generation in parallel (don't await yet)
             title_task = None
             if is_first_message:
-                title_task = asyncio.create_task(generate_conversation_title(request.content))
+                title_task = asyncio.create_task(
+                    generate_conversation_title(request.content)
+                )
 
-            # Stage 1: Collect responses
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
+            stage1_results = await stage1_collect_responses(
+                request.content,
+                conversation_history
+            )
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
-            # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+            stage2_results, label_to_model = await stage2_collect_rankings(
+                request.content,
+                stage1_results
+            )
+            aggregate_rankings = calculate_aggregate_rankings(
+                stage2_results,
+                label_to_model
+            )
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
-            # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            stage3_result = await stage3_synthesize_final(
+                request.content,
+                stage1_results,
+                stage2_results
+            )
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
-            # Wait for title generation if it was started
             if title_task:
                 title = await title_task
                 storage.update_conversation_title(conversation_id, title)
                 yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
 
-            # Save complete assistant message
             storage.add_assistant_message(
                 conversation_id,
                 stage1_results,
@@ -177,11 +179,9 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 stage3_result
             )
 
-            # Send completion event
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
-            # Send error event
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(
@@ -194,6 +194,125 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     )
 
 
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile):
+    """Transcribe audio to text using Whisper via Groq."""
+    try:
+        from .config import GROQ_API_KEY
+        audio_data = await audio.read()
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": (audio.filename, audio_data, audio.content_type)},
+                data={"model": "whisper-large-v3", "response_format": "json"}
+            )
+            response.raise_for_status()
+            result = response.json()
+            return {"text": result.get("text", "")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+
+@app.post("/api/analyze-image")
+async def analyze_image(
+    image: UploadFile,
+    question: str = "What do you see in this image? If this is an SAP screenshot, describe the error or content in detail."
+):
+    """Analyze image using Llama 4 Scout vision model via Groq."""
+    try:
+        from .config import GROQ_API_KEY
+        image_data = await image.read()
+        base64_image = base64.b64encode(image_data).decode('utf-8')
+        media_type = image.content_type or "image/jpeg"
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": question},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{media_type};base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "max_tokens": 1000
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            description = result['choices'][0]['message']['content']
+            return {"description": description}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image analysis failed: {str(e)}")
+
+
+@app.post("/api/extract-document")
+async def extract_document(document: UploadFile):
+    """Extract text from PDF, Word or text documents."""
+    try:
+        content_type = document.content_type or ""
+        file_data = await document.read()
+        extracted_text = ""
+
+        if "pdf" in content_type or document.filename.endswith(".pdf"):
+            try:
+                import pypdf
+                pdf_reader = pypdf.PdfReader(io.BytesIO(file_data))
+                for page in pdf_reader.pages:
+                    extracted_text += page.extract_text() + "\n"
+            except ImportError:
+                raise HTTPException(
+                    status_code=500,
+                    detail="pypdf not installed. Run: pip install pypdf --break-system-packages"
+                )
+
+        elif "word" in content_type or document.filename.endswith(".docx"):
+            try:
+                import docx
+                doc = docx.Document(io.BytesIO(file_data))
+                for para in doc.paragraphs:
+                    extracted_text += para.text + "\n"
+            except ImportError:
+                raise HTTPException(
+                    status_code=500,
+                    detail="python-docx not installed. Run: pip install python-docx --break-system-packages"
+                )
+
+        elif document.filename.endswith(".txt"):
+            extracted_text = file_data.decode('utf-8')
+
+        else:
+            extracted_text = file_data.decode('utf-8', errors='ignore')
+
+        return {
+            "text": extracted_text,
+            "filename": document.filename,
+            "characters": len(extracted_text)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document extraction failed: {str(e)}"
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
